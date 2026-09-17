@@ -68,7 +68,7 @@ describe('Iskra API', () => {
     })
     const [, refreshRequest] = fetchMock.lastCall(`${BASE_URL}user/v1/oauth/refresh`)
     expect(refreshRequest.headers).toMatchObject({
-      'user-agent': 'Android/GOOGLE/16/samsung/SM-S948B/1.8.3',
+      'user-agent': 'Android/GOOGLE/16/samsung/SM-S948B/1.9.0',
       'accept-language': 'RU'
     })
     expect(pluginData.saveDataRequested).toBe(true)
@@ -431,6 +431,404 @@ describe('Iskra API', () => {
     }])
   })
 
+  it('deduplicates repeated RRN versions without treating the result as page movement', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const operations = Array.from({ length: 87 }, (_, index) => ({
+      id: `operation-${index}`,
+      idType: 'rrn',
+      productId: 'card-1',
+      productType: 'CARD',
+      paymentDate: `2026-08-${String((index % 27) + 1).padStart(2, '0')}T12:00:00Z`,
+      operationDetail: { statusCode: 'EXECUTED' }
+    }))
+    operations[79] = {
+      ...operations[79],
+      id: 'shared-rrn',
+      paymentDate: '2026-08-27T16:18:22Z',
+      transactionSum: { amount: '-37.18', currency: 'BYN', sign: 'MINUS' },
+      operationDetail: { statusCode: 'IN_PROGRESS' }
+    }
+    const executedVersion = {
+      ...operations[79],
+      paymentDate: '2026-08-27T16:18:22Z',
+      transactionSum: { amount: '-37.18', currency: 'BYN', sign: 'MINUS' },
+      operationDetail: {
+        statusCode: 'EXECUTED',
+        operationDate: '2026-08-31T13:23:05Z',
+        authorizationCode: '861817'
+      }
+    }
+    const pages = [
+      operations.slice(0, 20),
+      operations.slice(20, 40),
+      operations.slice(40, 60),
+      operations.slice(60, 80),
+      [executedVersion, ...operations.slice(80)]
+    ]
+    for (const page of pages) {
+      fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+        status: 200,
+        body: { operations: page, totalCount: 88 }
+      }, { method: 'POST' })
+    }
+
+    const result = await fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-09-01T00:00:00Z')
+    )
+
+    expect(result).toHaveLength(87)
+    expect(result.filter(operation => operation.id === 'shared-rrn')).toEqual([executedVersion])
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20, 40, 60, 80])
+  })
+
+  it('deduplicates an exact repeated row within one page while advancing the raw offset', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const operation = { id: 'operation-0' }
+    const firstPage = [operation, operation, ...Array.from({ length: 18 }, (_, index) => ({ id: `operation-${index + 1}` }))]
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-19' }], totalCount: 21 }
+    }, { method: 'POST' })
+
+    const result = await fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )
+
+    expect(result.map(item => item.id)).toEqual(
+      Array.from({ length: 20 }, (_, index) => `operation-${index}`)
+    )
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20])
+  })
+
+  it('keeps reused RRN values separate when the card occurrence differs', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const operations = [
+      {
+        id: 'shared-rrn',
+        idType: 'rrn',
+        productId: 'card-1',
+        productType: 'CARD',
+        paymentDate: '2026-08-27T16:18:22Z',
+        transactionSum: { amount: '-37.18', currency: 'BYN', sign: 'MINUS' },
+        operationDetail: { statusCode: 'EXECUTED' }
+      },
+      {
+        id: 'shared-rrn',
+        idType: 'rrn',
+        productId: 'card-1',
+        productType: 'CARD',
+        paymentDate: '2026-08-28T16:18:22Z',
+        transactionSum: { amount: '-12.00', currency: 'BYN', sign: 'MINUS' },
+        operationDetail: { statusCode: 'EXECUTED' }
+      }
+    ]
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations, totalCount: 2 }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-09-01T00:00:00Z')
+    )).resolves.toEqual(operations)
+  })
+
+  it('logs and skips conflicting terminal versions of the same card occurrence', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const makeVersion = statusCode => ({
+      id: 'shared-rrn',
+      idType: 'rrn',
+      productId: 'card-1',
+      productType: 'CARD',
+      paymentDate: '2026-08-27T16:18:22Z',
+      transactionSum: { amount: '-37.18', currency: 'BYN', sign: 'MINUS' },
+      operationDetail: { statusCode }
+    })
+    const validOperation = { id: 'valid-operation', productId: 'card-1', productType: 'CARD' }
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [makeVersion('EXECUTED'), makeVersion('CANCELLED'), validOperation], totalCount: 3 }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-09-01T00:00:00Z')
+    )).resolves.toEqual([validOperation])
+    expect(fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)).toHaveLength(1)
+  })
+
+  it('logs and skips repeated card identifiers that lack fields required to identify an occurrence', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const makeVersion = statusCode => ({
+      id: 'shared-rrn',
+      idType: 'rrn',
+      productId: 'card-1',
+      productType: 'CARD',
+      paymentDate: '2026-08-27T16:18:22Z',
+      operationDetail: { statusCode }
+    })
+    const validOperation = { id: 'valid-operation', productId: 'card-1', productType: 'CARD' }
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [makeVersion('IN_PROGRESS'), makeVersion('EXECUTED'), validOperation], totalCount: 3 }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-09-01T00:00:00Z')
+    )).resolves.toEqual([validOperation])
+  })
+
+  it('returns de-duplicated best-effort operations when pages overlap', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({ id: `operation-${index}` }))
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 22 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-19' }], totalCount: 22 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-20' }], totalCount: 22 }
+    }, { method: 'POST' })
+    const result = await fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )
+
+    expect(result.map(operation => operation.id)).toEqual(
+      Array.from({ length: 21 }, (_, index) => `operation-${index}`)
+    )
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20, 21])
+  })
+
+  it('de-duplicates overlapping ACCOUNT operations when only the volatile UUID suffix changes', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const stablePrefix = '123456789'
+    const firstPage = [
+      ...Array.from({ length: 19 }, (_, index) => ({ id: `operation-${index}` })),
+      {
+        id: `${stablePrefix}_11111111-1111-4111-8111-111111111111`,
+        idType: 'actionId',
+        productId: 'account-1',
+        productType: 'ACCOUNT'
+      }
+    ]
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: {
+        operations: [{
+          id: `${stablePrefix}_22222222-2222-4222-8222-222222222222`,
+          idType: 'actionId',
+          productId: 'account-1',
+          productType: 'ACCOUNT'
+        }],
+        totalCount: 21
+      }
+    }, { method: 'POST' })
+    const result = await fetchTransactions(
+      'access-token',
+      [{ id: 'account-1', type: 'checking' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )
+
+    expect(result).toHaveLength(20)
+    expect(result[result.length - 1].id).toBe(`${stablePrefix}_11111111-1111-4111-8111-111111111111`)
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20])
+  })
+
+  it('continues pagination when totalCount changes between pages', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({ id: `operation-${index}` }))
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-20' }], totalCount: 22 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-21' }], totalCount: 22 }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )).resolves.toHaveLength(22)
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20, 21])
+  })
+
+  it('returns collected operations when totalCount decreases below the raw row count', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({ id: `operation-${index}` }))
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-20' }], totalCount: 20 }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )).resolves.toHaveLength(21)
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20])
+  })
+
+  it('converges on a later stable synchronization after a best-effort overlapping pass', async () => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({ id: `operation-${index}` }))
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-19' }], totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: firstPage, totalCount: 21 }
+    }, { method: 'POST' })
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: { operations: [{ id: 'operation-20' }], totalCount: 21 }
+    }, { method: 'POST' })
+
+    const firstResult = await fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )
+    const secondResult = await fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )
+
+    expect(firstResult).toHaveLength(20)
+    expect(secondResult.map(operation => operation.id)).toEqual(
+      Array.from({ length: 21 }, (_, index) => `operation-${index}`)
+    )
+    expect(fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)).toHaveLength(4)
+    const requestOffsets = fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)
+      .map(([, options]) => JSON.parse(options.body).pagination.offset)
+    expect(requestOffsets).toEqual([0, 20, 0, 20])
+  })
+
+  it.each([undefined, '', '   '])('logs and skips an operation with bank identifier %p', async id => {
+    const pluginData = makePluginDataApi({})
+    global.ZenMoney = {
+      device: { manufacturer: 'Zenmoney', model: 'Sync' },
+      ...pluginData.methods
+    }
+    const invalidOperation = { id, productId: 'card-1', productType: 'CARD' }
+    const validOperation = { id: 'valid-operation', productId: 'card-1', productType: 'CARD' }
+    fetchMock.once(`${BASE_URL}product-transaction/v1/operations`, {
+      status: 200,
+      body: {
+        operations: [invalidOperation, validOperation],
+        totalCount: 2
+      }
+    }, { method: 'POST' })
+
+    await expect(fetchTransactions(
+      'access-token',
+      [{ id: 'card-1', type: 'card' }],
+      new Date('2026-07-01T00:00:00Z'),
+      new Date('2026-07-29T00:00:00Z')
+    )).resolves.toEqual([validOperation])
+    expect(fetchMock.calls(`${BASE_URL}product-transaction/v1/operations`)).toHaveLength(1)
+  })
+
   it('refreshes an expired bearer token and retries a protected request once', async () => {
     const pluginData = makePluginDataApi({
       auth: { accessToken: 'expired-access-token', refreshToken: 'old-refresh-token', deviceTrustStatus: 'TRUSTED' }
@@ -627,7 +1025,7 @@ describe('Iskra API', () => {
     )).rejects.toBeInstanceOf(TemporaryError)
   })
 
-  it('stops when the bank returns an empty page before totalCount is reached', async () => {
+  it('returns collected operations when the bank returns an empty page before totalCount is reached', async () => {
     const pluginData = makePluginDataApi({})
     global.ZenMoney = {
       device: { manufacturer: 'Zenmoney', model: 'Sync' },
@@ -642,6 +1040,6 @@ describe('Iskra API', () => {
       'access-token',
       [{ id: 'card-1', type: 'card' }],
       new Date('2026-07-01T00:00:00Z')
-    )).rejects.toBeInstanceOf(TemporaryError)
+    )).resolves.toEqual([])
   })
 })

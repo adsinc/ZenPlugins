@@ -1,5 +1,6 @@
 import _ from 'lodash'
 import { adjustTransactions } from '../../common/transactionGroupHandler'
+import { InvalidPreferencesError } from '../../errors'
 import {
   activateDeviceToken,
   fetchAccounts,
@@ -18,6 +19,7 @@ import {
   buildActivationDescriptor,
   createDeviceIdentity,
   createDeviceState,
+  generateDevicePin,
   generateDeviceOtp,
   hashAccountLogin,
   openDeviceState,
@@ -26,7 +28,13 @@ import {
 } from './deviceOtp'
 
 const DEVICE_TOKEN_DATA_KEY = 'deviceOtp/v1'
+const DEVICE_PIN_DATA_KEY = 'deviceOtp/pin/v1'
+const DEVICE_PIN_DATA_VERSION = 1
 const ACTIVATION_CODE_TIMEOUT_MS = 180000
+const DEVICE_OTP_PERIOD_MS = 30000
+const DEVICE_OTP_BOUNDARY_GRACE_MS = 250
+const DEVICE_OTP_MAX_WAITS = 2
+const LEGACY_PIN_RECOVERY_ERROR = 'Не удалось открыть сохраненную активацию BGPB. Укажите прежний PIN токена в настройках для переноса.'
 
 /**
  * Full mailbox statements provide complete history when device authorization is
@@ -97,28 +105,95 @@ async function readActivationCode () {
   return normalized
 }
 
-async function initializeDeviceSession (preferences) {
-  const pin = String(preferences.appPin || '').trim()
-  if (pin.length === 0) {
-    return {
-      sid: await login(preferences.login, preferences.password),
-      activated: false,
-      deviceBound: false
-    }
+function readStoredPinEntry (entry) {
+  if (!entry || typeof entry.accountHash !== 'string') {
+    return null
   }
-  validateDevicePin(pin)
+  const pin = String(entry.pin || '').trim()
+  try {
+    validateDevicePin(pin)
+  } catch (_error) {
+    return null
+  }
+  return { accountHash: entry.accountHash, pin }
+}
 
+async function initializeDeviceSession (preferences) {
   const expectedAccountHash = hashAccountLogin(preferences.login)
   const storedEnvelope = ZenMoney.getData(DEVICE_TOKEN_DATA_KEY)
+  const storedPinData = ZenMoney.getData(DEVICE_PIN_DATA_KEY)
+  const activePinEntry = storedPinData?.version === DEVICE_PIN_DATA_VERSION
+    ? readStoredPinEntry(storedPinData.active)
+    : null
+  const pendingPinEntry = storedPinData?.version === DEVICE_PIN_DATA_VERSION
+    ? readStoredPinEntry(storedPinData.pending)
+    : null
+  const pendingPinForCurrentAccount = pendingPinEntry?.accountHash === expectedAccountHash
+  const legacyPin = String(preferences.appPin || '').trim()
+  const pinCandidates = []
+  if (activePinEntry) {
+    pinCandidates.push(activePinEntry.pin)
+  }
+  if (legacyPin && !pinCandidates.includes(legacyPin)) {
+    pinCandidates.push(legacyPin)
+  }
+
+  let pin = null
   let state = null
-  if (storedEnvelope) {
-    const storedState = openDeviceState(storedEnvelope, pin)
-    if (storedState.accountHash === expectedAccountHash) {
-      state = storedState
+  let openedDifferentAccount = false
+  if (storedEnvelope && !pendingPinForCurrentAccount) {
+    for (const candidate of pinCandidates) {
+      try {
+        validateDevicePin(candidate)
+      } catch (_error) {
+        continue
+      }
+      let storedState
+      try {
+        storedState = openDeviceState(storedEnvelope, candidate)
+      } catch (error) {
+        if (error instanceof InvalidPreferencesError) {
+          continue
+        }
+        throw error
+      }
+      if (storedState.accountHash === expectedAccountHash) {
+        pin = candidate
+        state = storedState
+        break
+      }
+      openedDifferentAccount = true
+    }
+    if (!state && !openedDifferentAccount) {
+      throw new InvalidPreferencesError(LEGACY_PIN_RECOVERY_ERROR)
+    }
+    if (state && (activePinEntry?.accountHash !== expectedAccountHash || activePinEntry.pin !== pin)) {
+      ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+        version: DEVICE_PIN_DATA_VERSION,
+        active: { accountHash: expectedAccountHash, pin },
+        pending: pendingPinEntry?.accountHash === expectedAccountHash ? null : pendingPinEntry
+      })
+      ZenMoney.saveData()
     }
   }
 
   if (!state) {
+    if (pendingPinForCurrentAccount) {
+      pin = pendingPinEntry.pin
+    } else if (!storedEnvelope && activePinEntry?.accountHash === expectedAccountHash) {
+      pin = activePinEntry.pin
+    }
+    if (!pin) {
+      pin = generateDevicePin()
+    }
+    if (!pendingPinForCurrentAccount) {
+      ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+        version: DEVICE_PIN_DATA_VERSION,
+        active: activePinEntry,
+        pending: { accountHash: expectedAccountHash, pin }
+      })
+      ZenMoney.saveData()
+    }
     const sid = await login(preferences.login, preferences.password)
     console.log('>>> Регистрация устройства для выписок BGPB...')
     const identity = createDeviceIdentity()
@@ -144,6 +219,11 @@ async function initializeDeviceSession (preferences) {
       identity
     })
     ZenMoney.setData(DEVICE_TOKEN_DATA_KEY, sealDeviceState(state, pin))
+    ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+      version: DEVICE_PIN_DATA_VERSION,
+      active: { accountHash: expectedAccountHash, pin },
+      pending: null
+    })
     ZenMoney.saveData()
     console.log('>>> Устройство BGPB активировано.')
     try {
@@ -151,25 +231,75 @@ async function initializeDeviceSession (preferences) {
     } catch (_error) {
       console.log('>>> Не удалось закрыть парольную сессию BGPB после активации.')
     }
-    return {
-      sid: await loginDeviceToken(state.deviceNo, generateDeviceOtp(state, pin)),
-      activated: true,
-      deviceBound: true,
-      getDeviceAuthorization: () => ({
-        deviceNo: state.deviceNo,
-        otp: generateDeviceOtp(state, pin)
-      })
-    }
+    return await openDeviceSession(state, pin, true)
   }
 
+  return await openDeviceSession(state, pin, false)
+}
+
+async function waitForNextDeviceOtpPeriod () {
+  const now = Date.now()
+  const nextPeriod = (Math.floor(now / DEVICE_OTP_PERIOD_MS) + 1) * DEVICE_OTP_PERIOD_MS
+  await new Promise(resolve => setTimeout(resolve, nextPeriod - now + DEVICE_OTP_BOUNDARY_GRACE_MS))
+}
+
+/**
+ * Provides one fresh OTP for protected actions without reusing the code that
+ * opened the device session.
+ */
+export function createDeviceAuthorizationProvider (state, pin, initialOtp, options = {}) {
+  const generateOtp = options.generateOtp || generateDeviceOtp
+  const waitForNextOtpPeriod = options.waitForNextOtpPeriod || waitForNextDeviceOtpPeriod
+  let cachedAuthorization = null
+  let authorizationPromise = null
+
+  return () => {
+    if (authorizationPromise) {
+      return authorizationPromise
+    }
+
+    const currentOtp = generateOtp(state, pin)
+    if (cachedAuthorization && cachedAuthorization.otp === currentOtp) {
+      return Promise.resolve(cachedAuthorization)
+    }
+
+    const nextAuthorizationPromise = (async () => {
+      let otp = currentOtp
+      let waits = 0
+      while (otp === initialOtp) {
+        if (waits >= DEVICE_OTP_MAX_WAITS) {
+          throw new InvalidPreferencesError('Не удалось получить свежий PIN-код BGPB. Проверьте время на устройстве.')
+        }
+        await waitForNextOtpPeriod()
+        waits += 1
+        otp = generateOtp(state, pin)
+      }
+      cachedAuthorization = { deviceNo: state.deviceNo, otp }
+      return cachedAuthorization
+    })()
+
+    authorizationPromise = nextAuthorizationPromise
+    nextAuthorizationPromise.then(
+      () => {
+        if (authorizationPromise === nextAuthorizationPromise) authorizationPromise = null
+      },
+      () => {
+        if (authorizationPromise === nextAuthorizationPromise) authorizationPromise = null
+      }
+    )
+    return nextAuthorizationPromise
+  }
+}
+
+async function openDeviceSession (state, pin, activated) {
+  const loginOtp = generateDeviceOtp(state, pin)
+  const sid = await loginDeviceToken(state.deviceNo, loginOtp)
+
   return {
-    sid: await loginDeviceToken(state.deviceNo, generateDeviceOtp(state, pin)),
-    activated: false,
+    sid,
+    activated,
     deviceBound: true,
-    getDeviceAuthorization: () => ({
-      deviceNo: state.deviceNo,
-      otp: generateDeviceOtp(state, pin)
-    })
+    getDeviceAuthorization: createDeviceAuthorizationProvider(state, pin, loginOtp)
   }
 }
 

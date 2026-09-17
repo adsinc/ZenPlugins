@@ -3,8 +3,9 @@ import { generateRandomString } from '../../common/utils'
 import { InvalidOtpCodeError, InvalidPreferencesError, TemporaryError } from '../../errors'
 
 const BASE_URL = 'https://bnb-mobile.bnb.by/'
-const APP_VERSION = '1.8.3'
+const APP_VERSION = '1.9.0'
 const PAGE_SIZE = 20
+const MAX_TRANSACTION_PAGES = 1000
 const DEVICE_KEY = 'device'
 const AUTH_KEY = 'auth'
 const TRUSTED_DEVICE_STATUS = 'TRUSTED'
@@ -203,7 +204,8 @@ function getUserAgent () {
 }
 
 function getErrorMessage (response) {
-  return response.body?.userMessage || response.body?.message || response.statusText || `HTTP ${response.status}`
+  return response.body?.userMessage || response.body?.message || response.body?.systemMessage ||
+    response.statusText || `HTTP ${response.status}`
 }
 
 function throwApiError (response, url, context) {
@@ -222,6 +224,9 @@ function throwApiError (response, url, context) {
   }
   if (url === 'user/v1/auth' && invalidPreferenceCodes.has(code)) {
     throw new InvalidPreferencesError(message)
+  }
+  if (code === 'APP_VERSION_IS_NOT_SUPPORTED') {
+    throw new TemporaryError(`BNB Iskra больше не поддерживает версию приложения, которую использует плагин. ${bankMessage}`)
   }
   if (blockedUserCodes.has(code)) {
     throw new TemporaryError('BNB Iskra заблокировал доступ к данным. Откройте приложение Iskra и выполните указанные там действия или обратитесь в поддержку BNB, затем повторите синхронизацию.')
@@ -562,8 +567,194 @@ function toIskraProductType (account) {
   }
 }
 
+function getOperationKey (operation) {
+  if (!operation || typeof operation.id !== 'string' || !operation.id.trim()) return null
+  if (operation.productType === 'ACCOUNT') {
+    const stableActionId = /^([0-9]+)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(operation.id)?.[1]
+    if (stableActionId) {
+      return [operation.productId, operation.productType, stableActionId].join('|')
+    }
+  }
+  return [operation.productId, operation.productType, operation.idType, operation.id]
+    .map(value => value == null ? '' : String(value))
+    .join('|')
+}
+
+function stringifyCanonical (value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stringifyCanonical).join(',')}]`
+  }
+  if (value != null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stringifyCanonical(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function getOperationVariantKey (operation, operationKey) {
+  return stringifyCanonical({ ...operation, id: operationKey })
+}
+
+function getMoneyKey (money) {
+  if (!money || typeof money !== 'object') return null
+  const amount = money.amount ?? (
+    money.integerPart != null && money.fractionalPart != null
+      ? `${money.sign || ''}:${money.integerPart}:${money.fractionalPart}`
+      : null
+  )
+  if (amount == null) return null
+  return [money.currency, money.sign, amount]
+    .map(value => value == null ? '' : String(value))
+    .join('|')
+}
+
+function getCardOccurrenceKey (operation, operationKey) {
+  if (operation.productType !== 'CARD' || !operation.paymentDate) return null
+  const moneyKey = getMoneyKey(operation.transactionSum) || getMoneyKey(operation.operationSum)
+  if (!moneyKey) return null
+  return [operationKey, operation.paymentDate, moneyKey, operation.operationName]
+    .map(value => value == null ? '' : String(value))
+    .join('|')
+}
+
+function selectCardOperationVersion (previous, next) {
+  const previousStatus = previous.operationDetail?.statusCode
+  const nextStatus = next.operationDetail?.statusCode
+  const terminalStatuses = new Set(['EXECUTED', 'CANCELLED'])
+
+  if (previousStatus === 'IN_PROGRESS' && terminalStatuses.has(nextStatus)) return next
+  if (nextStatus === 'IN_PROGRESS' && terminalStatuses.has(previousStatus)) return previous
+  return null
+}
+
+async function fetchTransactionSnapshot (accessToken, productTypes, dateRange) {
+  const operations = []
+  const operationVariantPages = new Map()
+  const operationIndexes = new Map()
+  const operationOccurrences = new Map()
+  const skippedOperationKeys = new Set()
+  const skippedOccurrenceKeys = new Set()
+  const driftReasons = new Set()
+  let rawOperationCount = 0
+  let totalCount = null
+  let pageCount = 0
+
+  do {
+    if (pageCount >= MAX_TRANSACTION_PAGES) {
+      throw new TemporaryError('Банк вернул слишком большой список операций. Повторите синхронизацию позже.')
+    }
+    pageCount++
+    const response = await fetchApiJson('product-transaction/v1/operations', {
+      method: 'POST',
+      headers: authHeaders(accessToken),
+      body: {
+        filter: {
+          date: dateRange,
+          productTypes
+        },
+        pagination: {
+          limit: PAGE_SIZE,
+          offset: rawOperationCount
+        }
+      }
+    }, 'Не удалось загрузить операции')
+    const responseTotalCount = Number(response?.totalCount)
+    if (!Array.isArray(response?.operations) || !Number.isInteger(responseTotalCount) || responseTotalCount < 0) {
+      throw new TemporaryError('Банк вернул некорректный список операций. Повторите синхронизацию позже.')
+    }
+    if (totalCount != null && responseTotalCount !== totalCount) {
+      driftReasons.add('изменился totalCount')
+    }
+    if (response.operations.length === 0) {
+      if (responseTotalCount > rawOperationCount) {
+        driftReasons.add('банк вернул пустую страницу до конца списка')
+      }
+      totalCount = responseTotalCount
+      break
+    }
+    const pageOffset = rawOperationCount
+    for (const operation of response.operations) {
+      const key = getOperationKey(operation)
+      if (!key) {
+        console.log('>>> Пропускаем операцию без идентификатора:', operation)
+        continue
+      }
+      if (skippedOperationKeys.has(key)) {
+        console.log('>>> Пропускаем операцию с неоднозначными версиями:', operation)
+        continue
+      }
+
+      const variantKey = getOperationVariantKey(operation, key)
+      const previousVariantPage = operationVariantPages.get(variantKey)
+      if (previousVariantPage != null) {
+        if (previousVariantPage !== pageOffset) {
+          driftReasons.add('страницы пересеклись')
+        }
+        continue
+      }
+      operationVariantPages.set(variantKey, pageOffset)
+
+      const occurrenceKey = getCardOccurrenceKey(operation, key)
+      const previousOccurrences = operationOccurrences.get(key)
+      if (occurrenceKey) {
+        if (skippedOccurrenceKeys.has(occurrenceKey)) {
+          console.log('>>> Пропускаем неоднозначную версию операции:', operation)
+          continue
+        }
+        const previousIndex = operationIndexes.get(occurrenceKey)
+        if (previousIndex != null) {
+          const selectedOperation = selectCardOperationVersion(operations[previousIndex], operation)
+          if (selectedOperation) {
+            operations[previousIndex] = selectedOperation
+          } else {
+            console.log('>>> Пропускаем неоднозначные версии операции:', {
+              previous: operations[previousIndex],
+              current: operation
+            })
+            skippedOccurrenceKeys.add(occurrenceKey)
+          }
+          continue
+        }
+        if (previousOccurrences?.has(null)) {
+          console.log('>>> Пропускаем операции с неоднозначными версиями:', operation)
+          skippedOperationKeys.add(key)
+          continue
+        }
+        operationIndexes.set(occurrenceKey, operations.length)
+      } else {
+        if (previousOccurrences) {
+          console.log('>>> Пропускаем операции с неоднозначными версиями:', operation)
+          skippedOperationKeys.add(key)
+          continue
+        }
+      }
+      if (previousOccurrences) {
+        previousOccurrences.add(occurrenceKey)
+      } else {
+        operationOccurrences.set(key, new Set([occurrenceKey]))
+      }
+      operations.push(operation)
+    }
+    rawOperationCount += response.operations.length
+    if (rawOperationCount > responseTotalCount) {
+      driftReasons.add('получено строк больше totalCount')
+    }
+    totalCount = responseTotalCount
+  } while (rawOperationCount < totalCount)
+
+  const safeOperations = operations.filter(operation => {
+    const key = getOperationKey(operation)
+    if (skippedOperationKeys.has(key)) return false
+    const occurrenceKey = getCardOccurrenceKey(operation, key)
+    return !occurrenceKey || !skippedOccurrenceKeys.has(occurrenceKey)
+  })
+  return { operations: safeOperations, driftReasons: [...driftReasons] }
+}
+
 /**
- * Fetches every operation in the requested interval using offset pagination.
+ * Fetches every raw operation in the requested interval using offset pagination,
+ * reconciles card lifecycle versions, and returns the best-effort result when
+ * the bank changes the result set between pages. A later synchronization loads
+ * the overlapping date range again and converges on the current operation list.
  */
 export async function fetchTransactions (accessToken, accounts, fromDate, toDate = new Date()) {
   console.log('>>> Загрузка списка транзакций...')
@@ -574,37 +765,14 @@ export async function fetchTransactions (accessToken, accounts, fromDate, toDate
     return []
   }
 
-  const operations = []
-  let totalCount = 0
-  do {
-    const response = await fetchApiJson('product-transaction/v1/operations', {
-      method: 'POST',
-      headers: authHeaders(accessToken),
-      body: {
-        filter: {
-          date: {
-            till: (toDate || new Date()).toISOString(),
-            from: fromDate.toISOString()
-          },
-          productTypes
-        },
-        pagination: {
-          limit: PAGE_SIZE,
-          offset: operations.length
-        }
-      }
-    }, 'Не удалось загрузить операции')
-    const responseTotalCount = Number(response?.totalCount)
-    if (!Array.isArray(response?.operations) || !Number.isInteger(responseTotalCount) || responseTotalCount < 0) {
-      throw new TemporaryError('Банк вернул некорректный список операций. Повторите синхронизацию позже.')
-    }
-    if (response.operations.length === 0 && responseTotalCount > operations.length) {
-      throw new TemporaryError('Банк вернул неполную страницу операций. Повторите синхронизацию позже.')
-    }
-    operations.push(...response.operations)
-    totalCount = responseTotalCount
-  } while (operations.length < totalCount)
-
-  console.log(`>>> Загружено ${operations.length} операций.`)
-  return operations
+  const dateRange = {
+    till: (toDate || new Date()).toISOString(),
+    from: fromDate.toISOString()
+  }
+  const snapshot = await fetchTransactionSnapshot(accessToken, productTypes, dateRange)
+  if (snapshot.driftReasons.length > 0) {
+    console.log(`>>> Список операций изменился во время загрузки (${snapshot.driftReasons.join(', ')}). Возвращаем собранные данные; следующая синхронизация уточнит результат.`)
+  }
+  console.log(`>>> Загружено ${snapshot.operations.length} операций.`)
+  return snapshot.operations
 }
